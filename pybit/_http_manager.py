@@ -1,15 +1,17 @@
 from collections import defaultdict
 from dataclasses import dataclass, field
 import time
+import pycurl
 import hmac
 import hashlib
+from io import BytesIO
 from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
 from Crypto.Signature import PKCS1_v1_5
 import base64
 import json
 import logging
-import requests
+from datetime import datetime as dt
 
 from datetime import datetime as dt
 
@@ -85,6 +87,15 @@ class _V5HTTPManager:
     referral_id: bool = field(default=None)
     record_request_time: bool = field(default=False)
     return_response_headers: bool = field(default=False)
+    headers: defaultdict[dict] = field(
+        default_factory=dict,
+        init=False,
+    )
+    response_headers: defaultdict[dict] = field(
+        default_factory=dict,
+        init=False,
+    )
+        
 
     def __post_init__(self):
         subdomain = SUBDOMAIN_TESTNET if self.testnet else SUBDOMAIN_MAINNET
@@ -116,15 +127,14 @@ class _V5HTTPManager:
 
         self.logger.debug("Initializing HTTP session.")
 
-        self.client = requests.Session()
-        self.client.headers.update(
-            {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            }
-        )
+        self.client = pycurl.Curl()
+        self.headers = [
+            "Content-Type: application/json",
+            "Accept: application/json",
+        ]
+        
         if self.referral_id:
-            self.client.headers.update({"Referer": self.referral_id})
+            self.headers.update({"Referer": self.referral_id})
 
     @staticmethod
     def prepare_payload(method, parameters):
@@ -184,6 +194,51 @@ class _V5HTTPManager:
             else:
                 return True
         return True
+    @staticmethod
+    def _header_function(self, header_line):
+        header_line = header_line.decode('utf-8')
+
+        if ':' in header_line:
+            name, value = header_line.split(':', 1)
+            self.response_headers[name.strip()] = value.strip()
+    
+    def _perform_request(self, url, method, timeout, data=None, headers=None):
+        buffer = BytesIO()
+        c = pycurl.Curl()
+        c.setopt(c.URL, url)
+        c.setopt(c.WRITEDATA, buffer)
+        c.setopt(c.TIMEOUT, timeout)
+        c.setopt(c.HEADERFUNCTION, self._header_function())
+
+        # Set headers
+        header_list = [f"{k}: {v}" for k, v in headers.items()]
+        c.setopt(c.HTTPHEADER, header_list)
+
+        if method == "POST":
+            c.setopt(c.POST, 1)
+            if data:
+                c.setopt(c.POSTFIELDS, json.dumps(data))
+        elif method == "PUT":
+            c.setopt(c.CUSTOMREQUEST, "PUT")
+            if data:
+                c.setopt(c.POSTFIELDS, json.dumps(data))
+        elif method == "DELETE":
+            c.setopt(c.CUSTOMREQUEST, "DELETE")
+        
+        start_time = time.time()
+        c.perform()
+        elapsed = time.time() - start_time
+
+        result = {
+            'status_code': c.getinfo(pycurl.pycurl.HTTP_CODE),
+            'response': buffer.getvalue().decode('utf-8'),
+            'repsonse_headers': self.response_headers,
+            'elapsed': elapsed
+        }
+        #c.close()
+
+        return result
+
 
     def _submit_request(self, method=None, path=None, query=None, auth=False):
         """
@@ -251,69 +306,66 @@ class _V5HTTPManager:
 
             if method == "GET":
                 if req_params:
-                    r = self.client.prepare_request(
-                        requests.Request(
-                            method, path + f"?{req_params}", headers=headers
-                        )
-                    )
-                else:
-                    r = self.client.prepare_request(
-                        requests.Request(method, path, headers=headers)
-                    )
-            else:
-                r = self.client.prepare_request(
-                    requests.Request(
-                        method, path, data=req_params, headers=headers
-                    )
-                )
+                    path += f"?{req_params}"
+
             
             # Log the request.
             if self.log_requests:
                 if req_params:
                     self.logger.debug(
                         f"Request -> {method} {path}. Body: {req_params}. "
-                        f"Headers: {r.headers}"
+                        f"Headers: {headers}"
                     )
                 else:
                     self.logger.debug(
-                        f"Request -> {method} {path}. Headers: {r.headers}"
+                        f"Request -> {method} {path}. Headers: {headers}"
                     )
 
             # Attempt the request.
             try:
-                s = self.client.send(r, timeout=self.timeout)
+                r = self._perform_request(
+                    url=path, 
+                    method=method, 
+                    data=req_params, 
+                    headers=headers
+                )
+                status_code = r['status_code']
+                response = r['response']
+                response_headers = r['repsonse_headers']
+                elapsed = r['elapsed']
 
             # If requests fires an error, retry.
-            except (
-                requests.exceptions.ReadTimeout,
-                requests.exceptions.SSLError,
-                requests.exceptions.ConnectionError,
-            ) as e:
-                if self.force_retry:
-                    self.logger.error(f"{e}. {retries_remaining}")
-                    time.sleep(self.retry_delay)
-                    continue
-                else:
-                    raise e
+            except pycurl.error as e:
+                error_number = e.args[0]
+                if error_number in [7, 28, 35]:
+                    # ReadTimeout: 28
+                    # SSLError: 35
+                    # ConnectionError: 7
+                    if self.force_retry:
+                        self.logger.error(f"{e}. {retries_remaining}")
+                        time.sleep(self.retry_delay)
+                        continue
+                    else:
+                        raise e
 
             # Check HTTP status code before trying to decode JSON.
-            if s.status_code != 200:
-                if s.status_code == 403:
+            if status_code != 200:
+                if status_code == 403:
                     error_msg = "You have breached the IP rate limit or your IP is from the USA."
                 else:
                     error_msg = "HTTP status code is not 200."
-                self.logger.debug(f"Response text: {s.text}")
+                self.logger.debug(f"Response text: {status_code}")
                 raise FailedRequestError(
                     request=f"{method} {path}: {req_params}",
                     message=error_msg,
-                    status_code=s.status_code,
+                    status_code=status_code,
                     time=dt.utcnow().strftime("%H:%M:%S"),
-                    resp_headers=s.headers,
+                    resp_headers=response_headers, 
                 )
 
             # Convert response to dictionary, or raise if requests error.
             try:
-                s_json = s.json()
+                s_json = response.json()
 
             # If we have trouble converting, handle the error and retry.
             except JSONDecodeError as e:
@@ -328,7 +380,7 @@ class _V5HTTPManager:
                         message="Conflict. Could not decode JSON.",
                         status_code=409,
                         time=dt.utcnow().strftime("%H:%M:%S"),
-                        resp_headers=s.headers,
+                        resp_headers=response_headers, 
                     )
 
             ret_code = "retCode"
@@ -381,17 +433,17 @@ class _V5HTTPManager:
                         message=s_json[ret_msg],
                         status_code=s_json[ret_code],
                         time=dt.utcnow().strftime("%H:%M:%S"),
-                        resp_headers=s.headers,
+                        resp_headers=response_headers,
                     )
             else:
                 if self.log_requests:
                     self.logger.debug(
-                        f"Response headers: {s.headers}"
+                        f"Response headers: {response_headers}"
                     )
 
                 if self.return_response_headers:
-                    return s_json, s.elapsed, s.headers,
+                    return s_json, elapsed, response_headers,
                 elif self.record_request_time:
-                    return s_json, s.elapsed
+                    return s_json, elapsed
                 else:
                     return s_json
