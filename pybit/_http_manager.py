@@ -131,6 +131,7 @@ class _V5HTTPManager:
         self.headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
+            'Connection': 'keep-alive',
         }
         
         if self.referral_id:
