@@ -128,10 +128,10 @@ class _V5HTTPManager:
         self.logger.debug("Initializing HTTP session.")
 
         self.client = pycurl.Curl()
-        self.headers = [
-            "Content-Type: application/json",
-            "Accept: application/json",
-        ]
+        self.headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
         
         if self.referral_id:
             self.headers.update({"Referer": self.referral_id})
@@ -208,7 +208,7 @@ class _V5HTTPManager:
         c.setopt(c.URL, url)
         c.setopt(c.WRITEDATA, buffer)
         c.setopt(c.TIMEOUT, timeout)
-        c.setopt(c.HEADERFUNCTION, self._header_function())
+        #c.setopt(c.HEADERFUNCTION, self._header_function())
 
         # Set headers
         header_list = [f"{k}: {v}" for k, v in headers.items()]
@@ -217,11 +217,11 @@ class _V5HTTPManager:
         if method == "POST":
             c.setopt(c.POST, 1)
             if data:
-                c.setopt(c.POSTFIELDS, json.dumps(data))
+                c.setopt(c.POSTFIELDS, data)
         elif method == "PUT":
             c.setopt(c.CUSTOMREQUEST, "PUT")
             if data:
-                c.setopt(c.POSTFIELDS, json.dumps(data))
+                c.setopt(c.POSTFIELDS, data)
         elif method == "DELETE":
             c.setopt(c.CUSTOMREQUEST, "DELETE")
         
@@ -230,13 +230,12 @@ class _V5HTTPManager:
         elapsed = time.time() - start_time
 
         result = {
-            'status_code': c.getinfo(pycurl.pycurl.HTTP_CODE),
+            'status_code': c.getinfo(pycurl.HTTP_CODE),
             'response': buffer.getvalue().decode('utf-8'),
             'repsonse_headers': self.response_headers,
             'elapsed': elapsed
         }
-        #c.close()
-
+        
         return result
 
 
@@ -293,16 +292,14 @@ class _V5HTTPManager:
                     recv_window=recv_window,
                     timestamp=timestamp,
                 )
-                headers = {
+                self.headers.update({
                     "Content-Type": "application/json",
                     "X-BAPI-API-KEY": self.api_key,
                     "X-BAPI-SIGN": signature,
                     "X-BAPI-SIGN-TYPE": "2",
                     "X-BAPI-TIMESTAMP": str(timestamp),
                     "X-BAPI-RECV-WINDOW": str(recv_window),
-                }
-            else:
-                headers = {}
+                })
 
             if method == "GET":
                 if req_params:
@@ -314,11 +311,11 @@ class _V5HTTPManager:
                 if req_params:
                     self.logger.debug(
                         f"Request -> {method} {path}. Body: {req_params}. "
-                        f"Headers: {headers}"
+                        f"Headers: {self.headers}"
                     )
                 else:
                     self.logger.debug(
-                        f"Request -> {method} {path}. Headers: {headers}"
+                        f"Request -> {method} {path}. Headers: {self.headers}"
                     )
 
             # Attempt the request.
@@ -326,8 +323,9 @@ class _V5HTTPManager:
                 r = self._perform_request(
                     url=path, 
                     method=method, 
+                    timeout=self.timeout,
                     data=req_params, 
-                    headers=headers
+                    headers=self.headers
                 )
                 status_code = r['status_code']
                 response = r['response']
@@ -365,7 +363,7 @@ class _V5HTTPManager:
 
             # Convert response to dictionary, or raise if requests error.
             try:
-                s_json = response.json()
+                s_json = json.loads(response)
 
             # If we have trouble converting, handle the error and retry.
             except JSONDecodeError as e:
